@@ -1,0 +1,68 @@
+name: Quality
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  python:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    env:
+      HOLD_LINE_LOAD_DOTENV: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14.7'
+          cache: pip
+          cache-dependency-path: requirements-dev.lock.txt
+      - run: python -m pip install -r requirements-dev.lock.txt
+      - run: python -m pip check
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: python -m pytest -ra
+      - run: python scripts/integration.py
+      - run: python scripts/check_supervisor.py
+  containers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      HOLD_LINE_LOAD_DOTENV: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14.7'
+      - run: python -m pip install -r requirements-dev.lock.txt -r requirements-infra.txt
+      - run: cfn-lint aws/cloudformation/stack.json
+      - run: pip-audit -r requirements.lock.txt --no-deps --disable-pip
+      - run: python scripts/setup.py
+      - name: Complete stack and acceptance
+        run: |
+          docker compose -f compose.stack.yml up --build -d --wait --wait-timeout 180
+          HOLD_LINE_TOKEN="$(python -c 'from dotenv import dotenv_values; print(dotenv_values(".env")["HOLD_LINE_TOKEN"])')"
+          export HOLD_LINE_TOKEN
+          python scripts/integration.py --external --queue
+      - name: Logs on failure
+        if: failure()
+        run: docker compose -f compose.stack.yml logs --tail=80
+      - name: Stop containers
+        if: always()
+        run: docker compose -f compose.stack.yml down --volumes
+      - name: Postgres and broker regression
+        run: |
+          docker compose up -d --wait
+          TEST_POSTGRES_URL="$(python -c 'from dotenv import dotenv_values; from urllib.parse import quote; p=quote(dotenv_values(".env")["POSTGRES_PASSWORD"],safe=""); print(f"postgresql://holdline:{p}@127.0.0.1:55432/holdline")')"
+          export TEST_POSTGRES_URL
+          python -m pytest -ra
+          python scripts/integration.py --postgres --queue
+      - name: Stop dependencies
+        if: always()
+        run: docker compose down --volumes
+      - run: python scripts/package_release.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: holdline-source
+          path: dist/holdline-*.zip*

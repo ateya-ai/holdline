@@ -1,0 +1,128 @@
+# Complete container stack. Only the learner UI/API is published to the host.
+x-app: &app
+  image: ${HOLD_LINE_IMAGE:-holdline:2.0.0}
+  build: .
+  init: true
+  read_only: true
+  tmpfs: [/tmp]
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  restart: unless-stopped
+  environment: &environment
+    HOLD_LINE_TOKEN: ${HOLD_LINE_TOKEN:?Run python scripts/setup.py first}
+    HOLD_LINE_LOAD_DOTENV: "false"
+    HOLD_LINE_BIND_HOST: 0.0.0.0
+    HOLD_LINE_RECEIVING_URL: http://receiving:8742
+    HOLD_LINE_POLICY_URL: http://policy:8743
+    HOLD_LINE_SHIPMENT_URL: http://shipment:8744
+    HOLD_LINE_DISPOSITION_URL: http://disposition:8745
+    HOLD_LINE_MCP_URL: http://mcp:8746
+    HOLD_LINE_ASYNC_ENABLED: "true"
+    REDIS_URL: redis://redis:6379/0
+    OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    OPENAI_MODEL: ${OPENAI_MODEL:-}
+    LANGSMITH_TRACING: ${LANGSMITH_TRACING:-false}
+    LANGSMITH_API_KEY: ${LANGSMITH_API_KEY:-}
+services:
+  postgres:
+    image: postgres:17.6-alpine@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: holdline
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run python scripts/setup.py first}
+      POSTGRES_DB: holdline
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U holdline -d holdline]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+  redis:
+    image: redis:8.2.1-alpine@sha256:987c376c727652f99625c7d205a1cba3cb2c53b92b0b62aade2bd48ee1593232
+    restart: unless-stopped
+    command: [redis-server, --appendonly, "yes"]
+    volumes: [redisdata:/data]
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+  mcp:
+    <<: *app
+    command: [python, -m, mcp_tools.shipment_server]
+    healthcheck:
+      test: [CMD, python, -m, holdline.healthcheck, mcp]
+      interval: 5s
+      timeout: 5s
+      start_period: 10s
+      retries: 20
+  policy:
+    <<: *app
+    command: [python, -m, specialists.server, policy]
+    depends_on:
+      mcp: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, python, -m, holdline.healthcheck, policy]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  shipment:
+    <<: *app
+    command: [python, -m, specialists.server, shipment]
+    depends_on:
+      mcp: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, python, -m, holdline.healthcheck, shipment]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  disposition:
+    <<: *app
+    command: [python, -m, specialists.server, disposition]
+    healthcheck:
+      test: [CMD, python, -m, holdline.healthcheck, disposition]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  receiving:
+    <<: *app
+    command: [python, -m, uvicorn, app.receiving:app, --host, 0.0.0.0, --port, "8742", --no-access-log]
+    environment:
+      <<: *environment
+      DATABASE_URL: postgresql://holdline:${POSTGRES_PASSWORD}@postgres:5432/holdline
+    depends_on:
+      postgres: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, python, -m, holdline.healthcheck, receiving]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  api:
+    <<: *app
+    command: [python, -m, uvicorn, app.api:app, --host, 0.0.0.0, --port, "8741", --no-access-log]
+    ports: [127.0.0.1:8741:8741]
+    depends_on:
+      policy: {condition: service_healthy}
+      shipment: {condition: service_healthy}
+      disposition: {condition: service_healthy}
+      receiving: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, python, -m, holdline.healthcheck, api]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  worker:
+    <<: *app
+    command: [celery, -A, app.celery_app:app, worker, --loglevel=INFO, --concurrency=2, --pool=threads]
+    depends_on:
+      api: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, python, -m, holdline.healthcheck, worker]
+      interval: 20s
+      timeout: 8s
+      start_period: 20s
+      retries: 10
+volumes:
+  pgdata:
+  redisdata:

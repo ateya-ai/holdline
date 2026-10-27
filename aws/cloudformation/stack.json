@@ -1,0 +1,2228 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Holdline complete ECS deployment in an existing VPC. Creates billable services; see aws/README.md.",
+  "Parameters": {
+    "VpcId": {
+      "Type": "AWS::EC2::VPC::Id"
+    },
+    "PrivateSubnetIds": {
+      "Type": "List<AWS::EC2::Subnet::Id>",
+      "Description": "Two private subnets in different AZs, with NAT or the required VPC endpoints"
+    },
+    "PublicSubnetIds": {
+      "Type": "List<AWS::EC2::Subnet::Id>",
+      "Description": "Two public subnets in different AZs for the HTTPS load balancer"
+    },
+    "ImageUri": {
+      "Type": "String",
+      "AllowedPattern": ".+@sha256:[a-f0-9]{64}",
+      "Description": "ECR application image pinned by digest; publish for linux/amd64"
+    },
+    "CertificateArn": {
+      "Type": "String",
+      "AllowedPattern": "arn:aws[a-z-]*:acm:.+",
+      "Description": "Issued ACM certificate in this region covering DomainName"
+    },
+    "DomainName": {
+      "Type": "String",
+      "AllowedPattern": "[A-Za-z0-9][A-Za-z0-9.-]+",
+      "Description": "Public DNS name for the API"
+    },
+    "HostedZoneId": {
+      "Type": "String",
+      "Default": "",
+      "Description": "Optional Route 53 public hosted zone; leave empty to manage DNS separately"
+    },
+    "NamespaceName": {
+      "Type": "String",
+      "Default": "holdline.local",
+      "AllowedPattern": "[a-z0-9][a-z0-9.-]+"
+    },
+    "ModelSecretArn": {
+      "Type": "String",
+      "Default": "",
+      "Description": "Optional Secrets Manager JSON secret with OPENAI_API_KEY; never paste a key here"
+    },
+    "ModelName": {
+      "Type": "String",
+      "Default": "",
+      "Description": "Optional provider model name; both model parameters are required for live wording"
+    },
+    "PostgresVersion": {
+      "Type": "String",
+      "Default": "17.6",
+      "AllowedPattern": "17\\.[0-9]+",
+      "Description": "PostgreSQL 17 minor version available in the deployment region"
+    }
+  },
+  "Conditions": {
+    "HasHostedZone": {
+      "Fn::Not": [
+        {
+          "Fn::Equals": [
+            {
+              "Ref": "HostedZoneId"
+            },
+            ""
+          ]
+        }
+      ]
+    },
+    "HasModel": {
+      "Fn::And": [
+        {
+          "Fn::Not": [
+            {
+              "Fn::Equals": [
+                {
+                  "Ref": "ModelSecretArn"
+                },
+                ""
+              ]
+            }
+          ]
+        },
+        {
+          "Fn::Not": [
+            {
+              "Fn::Equals": [
+                {
+                  "Ref": "ModelName"
+                },
+                ""
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "Resources": {
+    "Cluster": {
+      "Type": "AWS::ECS::Cluster",
+      "Properties": {
+        "ClusterSettings": [
+          {
+            "Name": "containerInsights",
+            "Value": "enabled"
+          }
+        ]
+      }
+    },
+    "Logs": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "RetentionInDays": 30
+      }
+    },
+    "BearerSecret": {
+      "Type": "AWS::SecretsManager::Secret",
+      "Properties": {
+        "Description": "Holdline service bearer token",
+        "GenerateSecretString": {
+          "PasswordLength": 48,
+          "ExcludePunctuation": true
+        }
+      }
+    },
+    "RedisSecret": {
+      "Type": "AWS::SecretsManager::Secret",
+      "Properties": {
+        "Description": "Holdline Redis AUTH token",
+        "GenerateSecretString": {
+          "PasswordLength": 48,
+          "ExcludePunctuation": true
+        }
+      }
+    },
+    "LoadBalancerSecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "GroupDescription": "Public HTTPS and HTTP redirect",
+        "VpcId": {
+          "Ref": "VpcId"
+        },
+        "SecurityGroupIngress": [
+          {
+            "IpProtocol": "tcp",
+            "FromPort": 80,
+            "ToPort": 80,
+            "CidrIp": "0.0.0.0/0"
+          },
+          {
+            "IpProtocol": "tcp",
+            "FromPort": 443,
+            "ToPort": 443,
+            "CidrIp": "0.0.0.0/0"
+          }
+        ]
+      }
+    },
+    "TaskSecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "GroupDescription": "Private Holdline services",
+        "VpcId": {
+          "Ref": "VpcId"
+        },
+        "SecurityGroupIngress": [
+          {
+            "IpProtocol": "tcp",
+            "FromPort": 8741,
+            "ToPort": 8741,
+            "SourceSecurityGroupId": {
+              "Ref": "LoadBalancerSecurityGroup"
+            }
+          }
+        ]
+      }
+    },
+    "InternalTraffic": {
+      "Type": "AWS::EC2::SecurityGroupIngress",
+      "Properties": {
+        "GroupId": {
+          "Ref": "TaskSecurityGroup"
+        },
+        "IpProtocol": "tcp",
+        "FromPort": 8742,
+        "ToPort": 8746,
+        "SourceSecurityGroupId": {
+          "Ref": "TaskSecurityGroup"
+        }
+      }
+    },
+    "DatabaseSecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "GroupDescription": "Only Holdline tasks may connect",
+        "VpcId": {
+          "Ref": "VpcId"
+        },
+        "SecurityGroupIngress": [
+          {
+            "IpProtocol": "tcp",
+            "FromPort": 5432,
+            "ToPort": 5432,
+            "SourceSecurityGroupId": {
+              "Ref": "TaskSecurityGroup"
+            }
+          }
+        ]
+      }
+    },
+    "RedisSecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "GroupDescription": "Only Holdline tasks may connect",
+        "VpcId": {
+          "Ref": "VpcId"
+        },
+        "SecurityGroupIngress": [
+          {
+            "IpProtocol": "tcp",
+            "FromPort": 6379,
+            "ToPort": 6379,
+            "SourceSecurityGroupId": {
+              "Ref": "TaskSecurityGroup"
+            }
+          }
+        ]
+      }
+    },
+    "DatabaseSubnets": {
+      "Type": "AWS::RDS::DBSubnetGroup",
+      "Properties": {
+        "DBSubnetGroupDescription": "Private database subnets",
+        "SubnetIds": {
+          "Ref": "PrivateSubnetIds"
+        }
+      }
+    },
+    "DatabaseParameters": {
+      "Type": "AWS::RDS::DBParameterGroup",
+      "Properties": {
+        "Description": "Require encrypted PostgreSQL sessions",
+        "Family": "postgres17",
+        "Parameters": {
+          "rds.force_ssl": "1"
+        }
+      }
+    },
+    "Database": {
+      "Type": "AWS::RDS::DBInstance",
+      "Properties": {
+        "Engine": "postgres",
+        "EngineVersion": {
+          "Ref": "PostgresVersion"
+        },
+        "DBInstanceClass": "db.t4g.micro",
+        "AllocatedStorage": "20",
+        "MaxAllocatedStorage": 100,
+        "StorageType": "gp3",
+        "StorageEncrypted": true,
+        "MultiAZ": true,
+        "BackupRetentionPeriod": 7,
+        "AutoMinorVersionUpgrade": true,
+        "PubliclyAccessible": false,
+        "MasterUsername": "holdline",
+        "ManageMasterUserPassword": true,
+        "DBName": "holdline",
+        "DBSubnetGroupName": {
+          "Ref": "DatabaseSubnets"
+        },
+        "DBParameterGroupName": {
+          "Ref": "DatabaseParameters"
+        },
+        "VPCSecurityGroups": [
+          {
+            "Ref": "DatabaseSecurityGroup"
+          }
+        ],
+        "DeletionProtection": true
+      },
+      "DeletionPolicy": "Snapshot",
+      "UpdateReplacePolicy": "Snapshot"
+    },
+    "RedisSubnets": {
+      "Type": "AWS::ElastiCache::SubnetGroup",
+      "Properties": {
+        "Description": "Private cache subnets",
+        "SubnetIds": {
+          "Ref": "PrivateSubnetIds"
+        }
+      }
+    },
+    "Redis": {
+      "Type": "AWS::ElastiCache::ReplicationGroup",
+      "Properties": {
+        "ReplicationGroupDescription": "Durable Holdline queue",
+        "Engine": "redis",
+        "EngineVersion": "7.1",
+        "CacheNodeType": "cache.t4g.micro",
+        "NumCacheClusters": 2,
+        "AutomaticFailoverEnabled": true,
+        "MultiAZEnabled": true,
+        "AtRestEncryptionEnabled": true,
+        "TransitEncryptionEnabled": true,
+        "AuthToken": {
+          "Fn::Sub": "{{resolve:secretsmanager:${RedisSecret}:SecretString}}"
+        },
+        "CacheSubnetGroupName": {
+          "Ref": "RedisSubnets"
+        },
+        "SecurityGroupIds": [
+          {
+            "Ref": "RedisSecurityGroup"
+          }
+        ],
+        "SnapshotRetentionLimit": 7
+      }
+    },
+    "Namespace": {
+      "Type": "AWS::ServiceDiscovery::PrivateDnsNamespace",
+      "Properties": {
+        "Name": {
+          "Ref": "NamespaceName"
+        },
+        "Vpc": {
+          "Ref": "VpcId"
+        }
+      }
+    },
+    "TaskRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "ecs-tasks.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        }
+      }
+    },
+    "LoadBalancer": {
+      "Type": "AWS::ElasticLoadBalancingV2::LoadBalancer",
+      "Properties": {
+        "Type": "application",
+        "Scheme": "internet-facing",
+        "Subnets": {
+          "Ref": "PublicSubnetIds"
+        },
+        "SecurityGroups": [
+          {
+            "Ref": "LoadBalancerSecurityGroup"
+          }
+        ]
+      }
+    },
+    "TargetGroup": {
+      "Type": "AWS::ElasticLoadBalancingV2::TargetGroup",
+      "Properties": {
+        "VpcId": {
+          "Ref": "VpcId"
+        },
+        "Port": 8741,
+        "Protocol": "HTTP",
+        "TargetType": "ip",
+        "HealthCheckPath": "/ready",
+        "HealthCheckIntervalSeconds": 15,
+        "HealthCheckTimeoutSeconds": 5,
+        "HealthyThresholdCount": 2,
+        "UnhealthyThresholdCount": 3,
+        "Matcher": {
+          "HttpCode": "200"
+        }
+      }
+    },
+    "HttpsListener": {
+      "Type": "AWS::ElasticLoadBalancingV2::Listener",
+      "Properties": {
+        "LoadBalancerArn": {
+          "Ref": "LoadBalancer"
+        },
+        "Port": 443,
+        "Protocol": "HTTPS",
+        "SslPolicy": "ELBSecurityPolicy-TLS13-1-2-2021-06",
+        "Certificates": [
+          {
+            "CertificateArn": {
+              "Ref": "CertificateArn"
+            }
+          }
+        ],
+        "DefaultActions": [
+          {
+            "Type": "forward",
+            "TargetGroupArn": {
+              "Ref": "TargetGroup"
+            }
+          }
+        ]
+      }
+    },
+    "HttpRedirect": {
+      "Type": "AWS::ElasticLoadBalancingV2::Listener",
+      "Properties": {
+        "LoadBalancerArn": {
+          "Ref": "LoadBalancer"
+        },
+        "Port": 80,
+        "Protocol": "HTTP",
+        "DefaultActions": [
+          {
+            "Type": "redirect",
+            "RedirectConfig": {
+              "Protocol": "HTTPS",
+              "Port": "443",
+              "StatusCode": "HTTP_301"
+            }
+          }
+        ]
+      }
+    },
+    "DnsRecord": {
+      "Type": "AWS::Route53::RecordSet",
+      "Properties": {
+        "HostedZoneId": {
+          "Ref": "HostedZoneId"
+        },
+        "Name": {
+          "Ref": "DomainName"
+        },
+        "Type": "A",
+        "AliasTarget": {
+          "DNSName": {
+            "Fn::GetAtt": [
+              "LoadBalancer",
+              "DNSName"
+            ]
+          },
+          "HostedZoneId": {
+            "Fn::GetAtt": [
+              "LoadBalancer",
+              "CanonicalHostedZoneID"
+            ]
+          }
+        }
+      },
+      "Condition": "HasHostedZone"
+    },
+    "ApiTask": {
+      "Type": "AWS::ECS::TaskDefinition",
+      "Properties": {
+        "Cpu": "256",
+        "Memory": "512",
+        "NetworkMode": "awsvpc",
+        "RequiresCompatibilities": [
+          "FARGATE"
+        ],
+        "RuntimePlatform": {
+          "CpuArchitecture": "X86_64",
+          "OperatingSystemFamily": "LINUX"
+        },
+        "ExecutionRoleArn": {
+          "Fn::GetAtt": [
+            "ApiExecutionRole",
+            "Arn"
+          ]
+        },
+        "TaskRoleArn": {
+          "Fn::GetAtt": [
+            "TaskRole",
+            "Arn"
+          ]
+        },
+        "ContainerDefinitions": [
+          {
+            "Name": "api",
+            "Image": {
+              "Ref": "ImageUri"
+            },
+            "Essential": true,
+            "Command": [
+              "python",
+              "-m",
+              "uvicorn",
+              "app.api:app",
+              "--host",
+              "0.0.0.0",
+              "--port",
+              "8741",
+              "--no-access-log"
+            ],
+            "Environment": [
+              {
+                "Name": "HOLD_LINE_BIND_HOST",
+                "Value": "0.0.0.0"
+              },
+              {
+                "Name": "HOLD_LINE_ASYNC_ENABLED",
+                "Value": "true"
+              },
+              {
+                "Name": "HOLD_LINE_RECEIVING_URL",
+                "Value": {
+                  "Fn::Sub": "http://receiving.${NamespaceName}:8742"
+                }
+              },
+              {
+                "Name": "HOLD_LINE_POLICY_URL",
+                "Value": {
+                  "Fn::Sub": "http://policy.${NamespaceName}:8743"
+                }
+              },
+              {
+                "Name": "HOLD_LINE_SHIPMENT_URL",
+                "Value": {
+                  "Fn::Sub": "http://shipment.${NamespaceName}:8744"
+                }
+              },
+              {
+                "Name": "HOLD_LINE_DISPOSITION_URL",
+                "Value": {
+                  "Fn::Sub": "http://disposition.${NamespaceName}:8745"
+                }
+              },
+              {
+                "Name": "HOLD_LINE_MCP_URL",
+                "Value": {
+                  "Fn::Sub": "http://mcp.${NamespaceName}:8746"
+                }
+              },
+              {
+                "Name": "HOLD_LINE_REDIS_HOST",
+                "Value": {
+                  "Fn::GetAtt": [
+                    "Redis",
+                    "PrimaryEndPoint.Address"
+                  ]
+                }
+              },
+              {
+                "Name": "OPENAI_MODEL",
+                "Value": {
+                  "Ref": "ModelName"
+                }
+              }
+            ],
+            "Secrets": [
+              {
+                "Name": "HOLD_LINE_TOKEN",
+                "ValueFrom": {
+                  "Ref": "BearerSecret"
+                }
+              },
+              {
+                "Name": "HOLD_LINE_REDIS_PASSWORD",
+                "ValueFrom": {
+                  "Ref": "RedisSecret"
+                }
+              },
+              {
+                "Fn::If": [
+                  "HasModel",
+                  {
+                    "Name": "OPENAI_API_KEY",
+                    "ValueFrom": {
+                      "Fn::Sub": "${ModelSecretArn}:OPENAI_API_KEY::"
+                    }
+                  },
+                  {
+                    "Ref": "AWS::NoValue"
+                  }
+                ]
+              }
+            ],
+            "LinuxParameters": {
+              "InitProcessEnabled": true
+            },
+            "LogConfiguration": {
+              "LogDriver": "awslogs",
+              "Options": {
+                "awslogs-group": {
+                  "Ref": "Logs"
+                },
+                "awslogs-region": {
+                  "Ref": "AWS::Region"
+                },
+                "awslogs-stream-prefix": "api"
+              }
+            },
+            "HealthCheck": {
+              "Command": [
+                "CMD",
+                "python",
+                "-m",
+                "holdline.healthcheck",
+                "api"
+              ],
+              "Interval": 30,
+              "Timeout": 8,
+              "Retries": 3,
+              "StartPeriod": 60
+            },
+            "PortMappings": [
+              {
+                "ContainerPort": 8741,
+                "Protocol": "tcp"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "ApiService": {
+      "Type": "AWS::ECS::Service",
+      "Properties": {
+        "Cluster": {
+          "Ref": "Cluster"
+        },
+        "LaunchType": "FARGATE",
+        "PlatformVersion": "1.4.0",
+        "DesiredCount": 1,
+        "TaskDefinition": {
+          "Ref": "ApiTask"
+        },
+        "DeploymentConfiguration": {
+          "DeploymentCircuitBreaker": {
+            "Enable": true,
+            "Rollback": true
+          },
+          "MinimumHealthyPercent": 100,
+          "MaximumPercent": 200
+        },
+        "NetworkConfiguration": {
+          "AwsvpcConfiguration": {
+            "AssignPublicIp": "DISABLED",
+            "Subnets": {
+              "Ref": "PrivateSubnetIds"
+            },
+            "SecurityGroups": [
+              {
+                "Ref": "TaskSecurityGroup"
+              }
+            ]
+          }
+        },
+        "LoadBalancers": [
+          {
+            "ContainerName": "api",
+            "ContainerPort": 8741,
+            "TargetGroupArn": {
+              "Ref": "TargetGroup"
+            }
+          }
+        ],
+        "HealthCheckGracePeriodSeconds": 90
+      },
+      "DependsOn": [
+        "HttpsListener"
+      ]
+    },
+    "ReceivingDiscovery": {
+      "Type": "AWS::ServiceDiscovery::Service",
+      "Properties": {
+        "Name": "receiving",
+        "NamespaceId": {
+          "Ref": "Namespace"
+        },
+        "DnsConfig": {
+          "DnsRecords": [
+            {
+              "Type": "A",
+              "TTL": 10
+            }
+          ],
+          "RoutingPolicy": "MULTIVALUE"
+        },
+        "HealthCheckCustomConfig": {
+          "FailureThreshold": 1
+        }
+      }
+    },
+    "ReceivingTask": {
+      "Type": "AWS::ECS::TaskDefinition",
+      "Properties": {
+        "Cpu": "256",
+        "Memory": "512",
+        "NetworkMode": "awsvpc",
+        "RequiresCompatibilities": [
+          "FARGATE"
+        ],
+        "RuntimePlatform": {
+          "CpuArchitecture": "X86_64",
+          "OperatingSystemFamily": "LINUX"
+        },
+        "ExecutionRoleArn": {
+          "Fn::GetAtt": [
+            "ReceivingExecutionRole",
+            "Arn"
+          ]
+        },
+        "TaskRoleArn": {
+          "Fn::GetAtt": [
+            "TaskRole",
+            "Arn"
+          ]
+        },
+        "ContainerDefinitions": [
+          {
+            "Name": "receiving",
+            "Image": {
+              "Ref": "ImageUri"
+            },
+            "Essential": true,
+            "Command": [
+              "python",
+              "-m",
+              "uvicorn",
+              "app.receiving:app",
+              "--host",
+              "0.0.0.0",
+              "--port",
+              "8742",
+              "--no-access-log"
+            ],
+            "Environment": [
+              {
+                "Name": "HOLD_LINE_BIND_HOST",
+                "Value": "0.0.0.0"
+              },
+              {
+                "Name": "HOLD_LINE_ASYNC_ENABLED",
+                "Value": "true"
+              },
+              {
+                "Name": "HOLD_LINE_RECEIVING_URL",
+                "Value": {
+                  "Fn::Sub": "http://receiving.${NamespaceName}:8742"
+                }
+              },
+              {
+                "Name": "HOLD_LINE_POLICY_URL",
+                "Value": {
+                  "Fn::Sub": "http://policy.${NamespaceName}:8743"
+                }
+              },
+              {
+                "Name": "HOLD_LINE_SHIPMENT_URL",
+                "Value": {
+                  "Fn::Sub": "http://shipment.${NamespaceName}:8744"
+                }
+              },
+              {
+                "Name": "HOLD_LINE_DISPOSITION_URL",
+                "Value": {
+                  "Fn::Sub": "http://disposition.${NamespaceName}:8745"
+                }
+              },
+              {
+                "Name": "HOLD_LINE_MCP_URL",
+                "Value": {
+                  "Fn::Sub": "http://mcp.${NamespaceName}:8746"
+                }
+              },
+              {
+                "Name": "HOLD_LINE_DB_HOST",
+                "Value": {
+                  "Fn::GetAtt": [
+                    "Database",
+                    "Endpoint.Address"
+                  ]
+                }
+              },
+              {
+                "Name": "HOLD_LINE_DB_SSLMODE",
+                "Value": "verify-full"
+              }
+            ],
+            "Secrets": [
+              {
+                "Name": "HOLD_LINE_TOKEN",
+                "ValueFrom": {
+                  "Ref": "BearerSecret"
+                }
+              },
+              {
+                "Name": "HOLD_LINE_DB_PASSWORD",
+                "ValueFrom": {
+                  "Fn::Sub": "${Database.MasterUserSecret.SecretArn}:password::"
+                }
+              }
+            ],
+            "LinuxParameters": {
+              "InitProcessEnabled": true
+            },
+            "LogConfiguration": {
+              "LogDriver": "awslogs",
+              "Options": {
+                "awslogs-group": {
+                  "Ref": "Logs"
+                },
+                "awslogs-region": {
+                  "Ref": "AWS::Region"
+                },
+                "awslogs-stream-prefix": "receiving"
+              }
+            },
+            "HealthCheck": {
+              "Command": [
+                "CMD",
+                "python",
+                "-m",
+                "holdline.healthcheck",
+                "receiving"
+              ],
+              "Interval": 30,
+              "Timeout": 8,
+              "Retries": 3,
+              "StartPeriod": 60
+            },
+            "PortMappings": [
+              {
+                "ContainerPort": 8742,
+                "Protocol": "tcp"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "ReceivingService": {
+      "Type": "AWS::ECS::Service",
+      "Properties": {
+        "Cluster": {
+          "Ref": "Cluster"
+        },
+        "LaunchType": "FARGATE",
+        "PlatformVersion": "1.4.0",
+        "DesiredCount": 1,
+        "TaskDefinition": {
+          "Ref": "ReceivingTask"
+        },
+        "DeploymentConfiguration": {
+          "DeploymentCircuitBreaker": {
+            "Enable": true,
+            "Rollback": true
+          },
+          "MinimumHealthyPercent": 100,
+          "MaximumPercent": 200
+        },
+        "NetworkConfiguration": {
+          "AwsvpcConfiguration": {
+            "AssignPublicIp": "DISABLED",
+            "Subnets": {
+              "Ref": "PrivateSubnetIds"
+            },
+            "SecurityGroups": [
+              {
+                "Ref": "TaskSecurityGroup"
+              }
+            ]
+          }
+        },
+        "ServiceRegistries": [
+          {
+            "RegistryArn": {
+              "Fn::GetAtt": [
+                "ReceivingDiscovery",
+                "Arn"
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "McpDiscovery": {
+      "Type": "AWS::ServiceDiscovery::Service",
+      "Properties": {
+        "Name": "mcp",
+        "NamespaceId": {
+          "Ref": "Namespace"
+        },
+        "DnsConfig": {
+          "DnsRecords": [
+            {
+              "Type": "A",
+              "TTL": 10
+            }
+          ],
+          "RoutingPolicy": "MULTIVALUE"
+        },
+        "HealthCheckCustomConfig": {
+          "FailureThreshold": 1
+        }
+      }
+    },
+    "McpTask": {
+      "Type": "AWS::ECS::TaskDefinition",
+      "Properties": {
+        "Cpu": "256",
+        "Memory": "512",
+        "NetworkMode": "awsvpc",
+        "RequiresCompatibilities": [
+          "FARGATE"
+        ],
+        "RuntimePlatform": {
+          "CpuArchitecture": "X86_64",
+          "OperatingSystemFamily": "LINUX"
+        },
+        "ExecutionRoleArn": {
+          "Fn::GetAtt": [
+            "McpExecutionRole",
+            "Arn"
+          ]
+        },
+        "TaskRoleArn": {
+          "Fn::GetAtt": [
+            "TaskRole",
+            "Arn"
+          ]
+        },
+        "ContainerDefinitions": [
+          {
+            "Name": "mcp",
+            "Image": {
+              "Ref": "ImageUri"
+            },
+            "Essential": true,
+            "Command": [
+              "python",
+              "-m",
+              "mcp_tools.shipment_server"
+            ],
+            "Environment": [
+              {
+                "Name": "HOLD_LINE_BIND_HOST",
+                "Value": "0.0.0.0"
+              },
+              {
+                "Name": "HOLD_LINE_ASYNC_ENABLED",
+                "Value": "true"
+              },
+              {
+                "Name": "HOLD_LINE_RECEIVING_URL",
+                "Value": {
+                  "Fn::Sub": "http://receiving.${NamespaceName}:8742"
+                }
+              },
+              {
+                "Name": "HOLD_LINE_POLICY_URL",
+                "Value": {
+                  "Fn::Sub": "http://policy.${NamespaceName}:8743"
+                }
+              },
+              {
+                "Name": "HOLD_LINE_SHIPMENT_URL",
+                "Value": {
+                  "Fn::Sub": "http://shipment.${NamespaceName}:8744"
+                }
+              },
+              {
+                "Name": "HOLD_LINE_DISPOSITION_URL",
+                "Value": {
+                  "Fn::Sub": "http://disposition.${NamespaceName}:8745"
+                }
+              },
+              {
+                "Name": "HOLD_LINE_MCP_URL",
+                "Value": {
+                  "Fn::Sub": "http://mcp.${NamespaceName}:8746"
+                }
+              }
+            ],
+            "Secrets": [
+              {
+                "Name": "HOLD_LINE_TOKEN",
+                "ValueFrom": {
+                  "Ref": "BearerSecret"
+                }
+              }
+            ],
+            "LinuxParameters": {
+              "InitProcessEnabled": true
+            },
+            "LogConfiguration": {
+              "LogDriver": "awslogs",
+              "Options": {
+                "awslogs-group": {
+                  "Ref": "Logs"
+                },
+                "awslogs-region": {
+                  "Ref": "AWS::Region"
+                },
+                "awslogs-stream-prefix": "mcp"
+              }
+            },
+            "HealthCheck": {
+              "Command": [
+                "CMD",
+                "python",
+                "-m",
+                "holdline.healthcheck",
+                "mcp"
+              ],
+              "Interval": 30,
+              "Timeout": 8,
+              "Retries": 3,
+              "StartPeriod": 60
+            },
+            "PortMappings": [
+              {
+                "ContainerPort": 8746,
+                "Protocol": "tcp"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "McpService": {
+      "Type": "AWS::ECS::Service",
+      "Properties": {
+        "Cluster": {
+          "Ref": "Cluster"
+        },
+        "LaunchType": "FARGATE",
+        "PlatformVersion": "1.4.0",
+        "DesiredCount": 1,
+        "TaskDefinition": {
+          "Ref": "McpTask"
+        },
+        "DeploymentConfiguration": {
+          "DeploymentCircuitBreaker": {
+            "Enable": true,
+            "Rollback": true
+          },
+          "MinimumHealthyPercent": 100,
+          "MaximumPercent": 200
+        },
+        "NetworkConfiguration": {
+          "AwsvpcConfiguration": {
+            "AssignPublicIp": "DISABLED",
+            "Subnets": {
+              "Ref": "PrivateSubnetIds"
+            },
+            "SecurityGroups": [
+              {
+                "Ref": "TaskSecurityGroup"
+              }
+            ]
+          }
+        },
+        "ServiceRegistries": [
+          {
+            "RegistryArn": {
+              "Fn::GetAtt": [
+                "McpDiscovery",
+                "Arn"
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "WorkerTask": {
+      "Type": "AWS::ECS::TaskDefinition",
+      "Properties": {
+        "Cpu": "256",
+        "Memory": "512",
+        "NetworkMode": "awsvpc",
+        "RequiresCompatibilities": [
+          "FARGATE"
+        ],
+        "RuntimePlatform": {
+          "CpuArchitecture": "X86_64",
+          "OperatingSystemFamily": "LINUX"
+        },
+        "ExecutionRoleArn": {
+          "Fn::GetAtt": [
+            "WorkerExecutionRole",
+            "Arn"
+          ]
+        },
+        "TaskRoleArn": {
+          "Fn::GetAtt": [
+            "TaskRole",
+            "Arn"
+          ]
+        },
+        "ContainerDefinitions": [
+          {
+            "Name": "worker",
+            "Image": {
+              "Ref": "ImageUri"
+            },
+            "Essential": true,
+            "Command": [
+              "celery",
+              "-A",
+              "app.celery_app:app",
+              "worker",
+              "--loglevel=INFO",
+              "--concurrency=2",
+              "--pool=threads"
+            ],
+            "Environment": [
+              {
+                "Name": "HOLD_LINE_BIND_HOST",
+                "Value": "0.0.0.0"
+              },
+              {
+                "Name": "HOLD_LINE_ASYNC_ENABLED",
+                "Value": "true"
+              },
+              {
+                "Name": "HOLD_LINE_RECEIVING_URL",
+                "Value": {
+                  "Fn::Sub": "http://receiving.${NamespaceName}:8742"
+                }
+              },
+              {
+                "Name": "HOLD_LINE_POLICY_URL",
+                "Value": {
+                  "Fn::Sub": "http://policy.${NamespaceName}:8743"
+                }
+              },
+              {
+                "Name": "HOLD_LINE_SHIPMENT_URL",
+                "Value": {
+                  "Fn::Sub": "http://shipment.${NamespaceName}:8744"
+                }
+              },
+              {
+                "Name": "HOLD_LINE_DISPOSITION_URL",
+                "Value": {
+                  "Fn::Sub": "http://disposition.${NamespaceName}:8745"
+                }
+              },
+              {
+                "Name": "HOLD_LINE_MCP_URL",
+                "Value": {
+                  "Fn::Sub": "http://mcp.${NamespaceName}:8746"
+                }
+              },
+              {
+                "Name": "HOLD_LINE_REDIS_HOST",
+                "Value": {
+                  "Fn::GetAtt": [
+                    "Redis",
+                    "PrimaryEndPoint.Address"
+                  ]
+                }
+              }
+            ],
+            "Secrets": [
+              {
+                "Name": "HOLD_LINE_TOKEN",
+                "ValueFrom": {
+                  "Ref": "BearerSecret"
+                }
+              },
+              {
+                "Name": "HOLD_LINE_REDIS_PASSWORD",
+                "ValueFrom": {
+                  "Ref": "RedisSecret"
+                }
+              }
+            ],
+            "LinuxParameters": {
+              "InitProcessEnabled": true
+            },
+            "LogConfiguration": {
+              "LogDriver": "awslogs",
+              "Options": {
+                "awslogs-group": {
+                  "Ref": "Logs"
+                },
+                "awslogs-region": {
+                  "Ref": "AWS::Region"
+                },
+                "awslogs-stream-prefix": "worker"
+              }
+            },
+            "HealthCheck": {
+              "Command": [
+                "CMD",
+                "python",
+                "-m",
+                "holdline.healthcheck",
+                "worker"
+              ],
+              "Interval": 30,
+              "Timeout": 8,
+              "Retries": 3,
+              "StartPeriod": 60
+            }
+          }
+        ]
+      }
+    },
+    "WorkerService": {
+      "Type": "AWS::ECS::Service",
+      "Properties": {
+        "Cluster": {
+          "Ref": "Cluster"
+        },
+        "LaunchType": "FARGATE",
+        "PlatformVersion": "1.4.0",
+        "DesiredCount": 1,
+        "TaskDefinition": {
+          "Ref": "WorkerTask"
+        },
+        "DeploymentConfiguration": {
+          "DeploymentCircuitBreaker": {
+            "Enable": true,
+            "Rollback": true
+          },
+          "MinimumHealthyPercent": 100,
+          "MaximumPercent": 200
+        },
+        "NetworkConfiguration": {
+          "AwsvpcConfiguration": {
+            "AssignPublicIp": "DISABLED",
+            "Subnets": {
+              "Ref": "PrivateSubnetIds"
+            },
+            "SecurityGroups": [
+              {
+                "Ref": "TaskSecurityGroup"
+              }
+            ]
+          }
+        }
+      }
+    },
+    "PolicyDiscovery": {
+      "Type": "AWS::ServiceDiscovery::Service",
+      "Properties": {
+        "Name": "policy",
+        "NamespaceId": {
+          "Ref": "Namespace"
+        },
+        "DnsConfig": {
+          "DnsRecords": [
+            {
+              "Type": "A",
+              "TTL": 10
+            }
+          ],
+          "RoutingPolicy": "MULTIVALUE"
+        },
+        "HealthCheckCustomConfig": {
+          "FailureThreshold": 1
+        }
+      }
+    },
+    "PolicyTask": {
+      "Type": "AWS::ECS::TaskDefinition",
+      "Properties": {
+        "Cpu": "256",
+        "Memory": "512",
+        "NetworkMode": "awsvpc",
+        "RequiresCompatibilities": [
+          "FARGATE"
+        ],
+        "RuntimePlatform": {
+          "CpuArchitecture": "X86_64",
+          "OperatingSystemFamily": "LINUX"
+        },
+        "ExecutionRoleArn": {
+          "Fn::GetAtt": [
+            "PolicyExecutionRole",
+            "Arn"
+          ]
+        },
+        "TaskRoleArn": {
+          "Fn::GetAtt": [
+            "TaskRole",
+            "Arn"
+          ]
+        },
+        "ContainerDefinitions": [
+          {
+            "Name": "policy",
+            "Image": {
+              "Ref": "ImageUri"
+            },
+            "Essential": true,
+            "Command": [
+              "python",
+              "-m",
+              "specialists.server",
+              "policy"
+            ],
+            "Environment": [
+              {
+                "Name": "HOLD_LINE_BIND_HOST",
+                "Value": "0.0.0.0"
+              },
+              {
+                "Name": "HOLD_LINE_ASYNC_ENABLED",
+                "Value": "true"
+              },
+              {
+                "Name": "HOLD_LINE_RECEIVING_URL",
+                "Value": {
+                  "Fn::Sub": "http://receiving.${NamespaceName}:8742"
+                }
+              },
+              {
+                "Name": "HOLD_LINE_POLICY_URL",
+                "Value": {
+                  "Fn::Sub": "http://policy.${NamespaceName}:8743"
+                }
+              },
+              {
+                "Name": "HOLD_LINE_SHIPMENT_URL",
+                "Value": {
+                  "Fn::Sub": "http://shipment.${NamespaceName}:8744"
+                }
+              },
+              {
+                "Name": "HOLD_LINE_DISPOSITION_URL",
+                "Value": {
+                  "Fn::Sub": "http://disposition.${NamespaceName}:8745"
+                }
+              },
+              {
+                "Name": "HOLD_LINE_MCP_URL",
+                "Value": {
+                  "Fn::Sub": "http://mcp.${NamespaceName}:8746"
+                }
+              }
+            ],
+            "Secrets": [
+              {
+                "Name": "HOLD_LINE_TOKEN",
+                "ValueFrom": {
+                  "Ref": "BearerSecret"
+                }
+              }
+            ],
+            "LinuxParameters": {
+              "InitProcessEnabled": true
+            },
+            "LogConfiguration": {
+              "LogDriver": "awslogs",
+              "Options": {
+                "awslogs-group": {
+                  "Ref": "Logs"
+                },
+                "awslogs-region": {
+                  "Ref": "AWS::Region"
+                },
+                "awslogs-stream-prefix": "policy"
+              }
+            },
+            "HealthCheck": {
+              "Command": [
+                "CMD",
+                "python",
+                "-m",
+                "holdline.healthcheck",
+                "policy"
+              ],
+              "Interval": 30,
+              "Timeout": 8,
+              "Retries": 3,
+              "StartPeriod": 60
+            },
+            "PortMappings": [
+              {
+                "ContainerPort": 8743,
+                "Protocol": "tcp"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "PolicyService": {
+      "Type": "AWS::ECS::Service",
+      "Properties": {
+        "Cluster": {
+          "Ref": "Cluster"
+        },
+        "LaunchType": "FARGATE",
+        "PlatformVersion": "1.4.0",
+        "DesiredCount": 1,
+        "TaskDefinition": {
+          "Ref": "PolicyTask"
+        },
+        "DeploymentConfiguration": {
+          "DeploymentCircuitBreaker": {
+            "Enable": true,
+            "Rollback": true
+          },
+          "MinimumHealthyPercent": 100,
+          "MaximumPercent": 200
+        },
+        "NetworkConfiguration": {
+          "AwsvpcConfiguration": {
+            "AssignPublicIp": "DISABLED",
+            "Subnets": {
+              "Ref": "PrivateSubnetIds"
+            },
+            "SecurityGroups": [
+              {
+                "Ref": "TaskSecurityGroup"
+              }
+            ]
+          }
+        },
+        "ServiceRegistries": [
+          {
+            "RegistryArn": {
+              "Fn::GetAtt": [
+                "PolicyDiscovery",
+                "Arn"
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "ShipmentDiscovery": {
+      "Type": "AWS::ServiceDiscovery::Service",
+      "Properties": {
+        "Name": "shipment",
+        "NamespaceId": {
+          "Ref": "Namespace"
+        },
+        "DnsConfig": {
+          "DnsRecords": [
+            {
+              "Type": "A",
+              "TTL": 10
+            }
+          ],
+          "RoutingPolicy": "MULTIVALUE"
+        },
+        "HealthCheckCustomConfig": {
+          "FailureThreshold": 1
+        }
+      }
+    },
+    "ShipmentTask": {
+      "Type": "AWS::ECS::TaskDefinition",
+      "Properties": {
+        "Cpu": "256",
+        "Memory": "512",
+        "NetworkMode": "awsvpc",
+        "RequiresCompatibilities": [
+          "FARGATE"
+        ],
+        "RuntimePlatform": {
+          "CpuArchitecture": "X86_64",
+          "OperatingSystemFamily": "LINUX"
+        },
+        "ExecutionRoleArn": {
+          "Fn::GetAtt": [
+            "ShipmentExecutionRole",
+            "Arn"
+          ]
+        },
+        "TaskRoleArn": {
+          "Fn::GetAtt": [
+            "TaskRole",
+            "Arn"
+          ]
+        },
+        "ContainerDefinitions": [
+          {
+            "Name": "shipment",
+            "Image": {
+              "Ref": "ImageUri"
+            },
+            "Essential": true,
+            "Command": [
+              "python",
+              "-m",
+              "specialists.server",
+              "shipment"
+            ],
+            "Environment": [
+              {
+                "Name": "HOLD_LINE_BIND_HOST",
+                "Value": "0.0.0.0"
+              },
+              {
+                "Name": "HOLD_LINE_ASYNC_ENABLED",
+                "Value": "true"
+              },
+              {
+                "Name": "HOLD_LINE_RECEIVING_URL",
+                "Value": {
+                  "Fn::Sub": "http://receiving.${NamespaceName}:8742"
+                }
+              },
+              {
+                "Name": "HOLD_LINE_POLICY_URL",
+                "Value": {
+                  "Fn::Sub": "http://policy.${NamespaceName}:8743"
+                }
+              },
+              {
+                "Name": "HOLD_LINE_SHIPMENT_URL",
+                "Value": {
+                  "Fn::Sub": "http://shipment.${NamespaceName}:8744"
+                }
+              },
+              {
+                "Name": "HOLD_LINE_DISPOSITION_URL",
+                "Value": {
+                  "Fn::Sub": "http://disposition.${NamespaceName}:8745"
+                }
+              },
+              {
+                "Name": "HOLD_LINE_MCP_URL",
+                "Value": {
+                  "Fn::Sub": "http://mcp.${NamespaceName}:8746"
+                }
+              }
+            ],
+            "Secrets": [
+              {
+                "Name": "HOLD_LINE_TOKEN",
+                "ValueFrom": {
+                  "Ref": "BearerSecret"
+                }
+              }
+            ],
+            "LinuxParameters": {
+              "InitProcessEnabled": true
+            },
+            "LogConfiguration": {
+              "LogDriver": "awslogs",
+              "Options": {
+                "awslogs-group": {
+                  "Ref": "Logs"
+                },
+                "awslogs-region": {
+                  "Ref": "AWS::Region"
+                },
+                "awslogs-stream-prefix": "shipment"
+              }
+            },
+            "HealthCheck": {
+              "Command": [
+                "CMD",
+                "python",
+                "-m",
+                "holdline.healthcheck",
+                "shipment"
+              ],
+              "Interval": 30,
+              "Timeout": 8,
+              "Retries": 3,
+              "StartPeriod": 60
+            },
+            "PortMappings": [
+              {
+                "ContainerPort": 8744,
+                "Protocol": "tcp"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "ShipmentService": {
+      "Type": "AWS::ECS::Service",
+      "Properties": {
+        "Cluster": {
+          "Ref": "Cluster"
+        },
+        "LaunchType": "FARGATE",
+        "PlatformVersion": "1.4.0",
+        "DesiredCount": 1,
+        "TaskDefinition": {
+          "Ref": "ShipmentTask"
+        },
+        "DeploymentConfiguration": {
+          "DeploymentCircuitBreaker": {
+            "Enable": true,
+            "Rollback": true
+          },
+          "MinimumHealthyPercent": 100,
+          "MaximumPercent": 200
+        },
+        "NetworkConfiguration": {
+          "AwsvpcConfiguration": {
+            "AssignPublicIp": "DISABLED",
+            "Subnets": {
+              "Ref": "PrivateSubnetIds"
+            },
+            "SecurityGroups": [
+              {
+                "Ref": "TaskSecurityGroup"
+              }
+            ]
+          }
+        },
+        "ServiceRegistries": [
+          {
+            "RegistryArn": {
+              "Fn::GetAtt": [
+                "ShipmentDiscovery",
+                "Arn"
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "DispositionDiscovery": {
+      "Type": "AWS::ServiceDiscovery::Service",
+      "Properties": {
+        "Name": "disposition",
+        "NamespaceId": {
+          "Ref": "Namespace"
+        },
+        "DnsConfig": {
+          "DnsRecords": [
+            {
+              "Type": "A",
+              "TTL": 10
+            }
+          ],
+          "RoutingPolicy": "MULTIVALUE"
+        },
+        "HealthCheckCustomConfig": {
+          "FailureThreshold": 1
+        }
+      }
+    },
+    "DispositionTask": {
+      "Type": "AWS::ECS::TaskDefinition",
+      "Properties": {
+        "Cpu": "256",
+        "Memory": "512",
+        "NetworkMode": "awsvpc",
+        "RequiresCompatibilities": [
+          "FARGATE"
+        ],
+        "RuntimePlatform": {
+          "CpuArchitecture": "X86_64",
+          "OperatingSystemFamily": "LINUX"
+        },
+        "ExecutionRoleArn": {
+          "Fn::GetAtt": [
+            "DispositionExecutionRole",
+            "Arn"
+          ]
+        },
+        "TaskRoleArn": {
+          "Fn::GetAtt": [
+            "TaskRole",
+            "Arn"
+          ]
+        },
+        "ContainerDefinitions": [
+          {
+            "Name": "disposition",
+            "Image": {
+              "Ref": "ImageUri"
+            },
+            "Essential": true,
+            "Command": [
+              "python",
+              "-m",
+              "specialists.server",
+              "disposition"
+            ],
+            "Environment": [
+              {
+                "Name": "HOLD_LINE_BIND_HOST",
+                "Value": "0.0.0.0"
+              },
+              {
+                "Name": "HOLD_LINE_ASYNC_ENABLED",
+                "Value": "true"
+              },
+              {
+                "Name": "HOLD_LINE_RECEIVING_URL",
+                "Value": {
+                  "Fn::Sub": "http://receiving.${NamespaceName}:8742"
+                }
+              },
+              {
+                "Name": "HOLD_LINE_POLICY_URL",
+                "Value": {
+                  "Fn::Sub": "http://policy.${NamespaceName}:8743"
+                }
+              },
+              {
+                "Name": "HOLD_LINE_SHIPMENT_URL",
+                "Value": {
+                  "Fn::Sub": "http://shipment.${NamespaceName}:8744"
+                }
+              },
+              {
+                "Name": "HOLD_LINE_DISPOSITION_URL",
+                "Value": {
+                  "Fn::Sub": "http://disposition.${NamespaceName}:8745"
+                }
+              },
+              {
+                "Name": "HOLD_LINE_MCP_URL",
+                "Value": {
+                  "Fn::Sub": "http://mcp.${NamespaceName}:8746"
+                }
+              },
+              {
+                "Name": "OPENAI_MODEL",
+                "Value": {
+                  "Ref": "ModelName"
+                }
+              }
+            ],
+            "Secrets": [
+              {
+                "Name": "HOLD_LINE_TOKEN",
+                "ValueFrom": {
+                  "Ref": "BearerSecret"
+                }
+              },
+              {
+                "Fn::If": [
+                  "HasModel",
+                  {
+                    "Name": "OPENAI_API_KEY",
+                    "ValueFrom": {
+                      "Fn::Sub": "${ModelSecretArn}:OPENAI_API_KEY::"
+                    }
+                  },
+                  {
+                    "Ref": "AWS::NoValue"
+                  }
+                ]
+              }
+            ],
+            "LinuxParameters": {
+              "InitProcessEnabled": true
+            },
+            "LogConfiguration": {
+              "LogDriver": "awslogs",
+              "Options": {
+                "awslogs-group": {
+                  "Ref": "Logs"
+                },
+                "awslogs-region": {
+                  "Ref": "AWS::Region"
+                },
+                "awslogs-stream-prefix": "disposition"
+              }
+            },
+            "HealthCheck": {
+              "Command": [
+                "CMD",
+                "python",
+                "-m",
+                "holdline.healthcheck",
+                "disposition"
+              ],
+              "Interval": 30,
+              "Timeout": 8,
+              "Retries": 3,
+              "StartPeriod": 60
+            },
+            "PortMappings": [
+              {
+                "ContainerPort": 8745,
+                "Protocol": "tcp"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "DispositionService": {
+      "Type": "AWS::ECS::Service",
+      "Properties": {
+        "Cluster": {
+          "Ref": "Cluster"
+        },
+        "LaunchType": "FARGATE",
+        "PlatformVersion": "1.4.0",
+        "DesiredCount": 1,
+        "TaskDefinition": {
+          "Ref": "DispositionTask"
+        },
+        "DeploymentConfiguration": {
+          "DeploymentCircuitBreaker": {
+            "Enable": true,
+            "Rollback": true
+          },
+          "MinimumHealthyPercent": 100,
+          "MaximumPercent": 200
+        },
+        "NetworkConfiguration": {
+          "AwsvpcConfiguration": {
+            "AssignPublicIp": "DISABLED",
+            "Subnets": {
+              "Ref": "PrivateSubnetIds"
+            },
+            "SecurityGroups": [
+              {
+                "Ref": "TaskSecurityGroup"
+              }
+            ]
+          }
+        },
+        "ServiceRegistries": [
+          {
+            "RegistryArn": {
+              "Fn::GetAtt": [
+                "DispositionDiscovery",
+                "Arn"
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "ApiExecutionRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "ecs-tasks.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "ManagedPolicyArns": [
+          {
+            "Fn::Sub": "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+          }
+        ],
+        "Policies": [
+          {
+            "PolicyName": "ReadRoleSecrets",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "secretsmanager:GetSecretValue"
+                  ],
+                  "Resource": [
+                    {
+                      "Ref": "BearerSecret"
+                    },
+                    {
+                      "Ref": "RedisSecret"
+                    },
+                    {
+                      "Fn::If": [
+                        "HasModel",
+                        {
+                          "Ref": "ModelSecretArn"
+                        },
+                        {
+                          "Ref": "AWS::NoValue"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "ReceivingExecutionRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "ecs-tasks.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "ManagedPolicyArns": [
+          {
+            "Fn::Sub": "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+          }
+        ],
+        "Policies": [
+          {
+            "PolicyName": "ReadRoleSecrets",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "secretsmanager:GetSecretValue"
+                  ],
+                  "Resource": [
+                    {
+                      "Ref": "BearerSecret"
+                    },
+                    {
+                      "Fn::GetAtt": [
+                        "Database",
+                        "MasterUserSecret.SecretArn"
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "PolicyExecutionRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "ecs-tasks.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "ManagedPolicyArns": [
+          {
+            "Fn::Sub": "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+          }
+        ],
+        "Policies": [
+          {
+            "PolicyName": "ReadRoleSecrets",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "secretsmanager:GetSecretValue"
+                  ],
+                  "Resource": [
+                    {
+                      "Ref": "BearerSecret"
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "ShipmentExecutionRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "ecs-tasks.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "ManagedPolicyArns": [
+          {
+            "Fn::Sub": "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+          }
+        ],
+        "Policies": [
+          {
+            "PolicyName": "ReadRoleSecrets",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "secretsmanager:GetSecretValue"
+                  ],
+                  "Resource": [
+                    {
+                      "Ref": "BearerSecret"
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "DispositionExecutionRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "ecs-tasks.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "ManagedPolicyArns": [
+          {
+            "Fn::Sub": "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+          }
+        ],
+        "Policies": [
+          {
+            "PolicyName": "ReadRoleSecrets",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "secretsmanager:GetSecretValue"
+                  ],
+                  "Resource": [
+                    {
+                      "Ref": "BearerSecret"
+                    },
+                    {
+                      "Fn::If": [
+                        "HasModel",
+                        {
+                          "Ref": "ModelSecretArn"
+                        },
+                        {
+                          "Ref": "AWS::NoValue"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "McpExecutionRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "ecs-tasks.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "ManagedPolicyArns": [
+          {
+            "Fn::Sub": "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+          }
+        ],
+        "Policies": [
+          {
+            "PolicyName": "ReadRoleSecrets",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "secretsmanager:GetSecretValue"
+                  ],
+                  "Resource": [
+                    {
+                      "Ref": "BearerSecret"
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "WorkerExecutionRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "ecs-tasks.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "ManagedPolicyArns": [
+          {
+            "Fn::Sub": "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+          }
+        ],
+        "Policies": [
+          {
+            "PolicyName": "ReadRoleSecrets",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "secretsmanager:GetSecretValue"
+                  ],
+                  "Resource": [
+                    {
+                      "Ref": "BearerSecret"
+                    },
+                    {
+                      "Ref": "RedisSecret"
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "ApiErrors": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmDescription": "Inspect API dependency errors and service health",
+        "Namespace": "AWS/ApplicationELB",
+        "MetricName": "HTTPCode_Target_5XX_Count",
+        "Dimensions": [
+          {
+            "Name": "LoadBalancer",
+            "Value": {
+              "Fn::GetAtt": [
+                "LoadBalancer",
+                "LoadBalancerFullName"
+              ]
+            }
+          }
+        ],
+        "Statistic": "Sum",
+        "Period": 60,
+        "EvaluationPeriods": 3,
+        "Threshold": 5,
+        "ComparisonOperator": "GreaterThanThreshold",
+        "TreatMissingData": "notBreaching"
+      }
+    }
+  },
+  "Outputs": {
+    "Url": {
+      "Value": {
+        "Fn::Sub": "https://${DomainName}"
+      }
+    },
+    "LoadBalancerDns": {
+      "Value": {
+        "Fn::GetAtt": [
+          "LoadBalancer",
+          "DNSName"
+        ]
+      }
+    },
+    "BearerSecretArn": {
+      "Value": {
+        "Ref": "BearerSecret"
+      }
+    },
+    "ClusterName": {
+      "Value": {
+        "Ref": "Cluster"
+      }
+    },
+    "LogGroup": {
+      "Value": {
+        "Ref": "Logs"
+      }
+    },
+    "DatabaseId": {
+      "Value": {
+        "Ref": "Database"
+      }
+    }
+  }
+}

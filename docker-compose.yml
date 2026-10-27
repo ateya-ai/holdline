@@ -1,0 +1,28 @@
+# Optional dependencies for a Python-hosted application.
+services:
+  postgres:
+    image: postgres:17.6-alpine@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94
+    environment:
+      POSTGRES_USER: holdline
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-holdline}
+      POSTGRES_DB: holdline
+    ports: ["127.0.0.1:55432:5432"]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U holdline -d holdline"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+  redis:
+    image: redis:8.2.1-alpine@sha256:987c376c727652f99625c7d205a1cba3cb2c53b92b0b62aade2bd48ee1593232
+    command: ["redis-server", "--appendonly", "yes"]
+    ports: ["127.0.0.1:63791:6379"]
+    volumes: ["redisdata:/data"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+volumes:
+  pgdata:
+  redisdata:

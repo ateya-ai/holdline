@@ -1,0 +1,11 @@
+[tool.ruff]
+target-version = "py314"
+line-length = 100
+extend-exclude = [".venv", "dist", ".run"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B", "UP"]
+extend-safe-fixes = ["UP017"]
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Query", "fastapi.Header"]

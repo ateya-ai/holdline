@@ -1,0 +1,34 @@
+{
+  "HL-2201": {
+    "age_days": 4,
+    "category": "dry-goods",
+    "documents": "complete",
+    "damage": false,
+    "already_received": false,
+    "summary": "Inbound rice pallets. The packing list arrived with the freight."
+  },
+  "HL-2202": {
+    "age_days": 2,
+    "category": "dry-goods",
+    "documents": "complete",
+    "damage": false,
+    "already_received": true,
+    "summary": "This pallet was already received on an earlier appointment."
+  },
+  "HL-2203": {
+    "age_days": 40,
+    "category": "dry-goods",
+    "documents": "complete",
+    "damage": false,
+    "already_received": false,
+    "summary": "Canned goods that have been on the hold line past the window."
+  },
+  "HL-2204": {
+    "age_days": 3,
+    "category": "hazmat",
+    "documents": "missing",
+    "damage": true,
+    "already_received": false,
+    "summary": "Damaged hazmat drum. Documents were not in the packet."
+  }
+}

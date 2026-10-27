@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Holdline receiving desk</title>
+<style>
+body{font-family:system-ui,sans-serif;margin:3rem auto;max-width:52rem;padding:0 1rem;color:#172b32;background:#f7f8f6;line-height:1.6}h1{font-weight:600}label{display:block;margin:1rem 0 .3rem}input,select,button{font:inherit;padding:.6rem;border:1px solid #829298;border-radius:4px}input{width:95%}button{margin:1rem .5rem 1rem 0;background:#163e46;color:white;cursor:pointer}button:disabled{opacity:.5}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:white;border:1px solid #dbe2df;padding:1rem}small{color:#42575e}.status{font-weight:600}
+</style>
+</head>
+<body>
+<h1>Holdline receiving desk</h1>
+<p>Review a synthetic shipment using policy and shipment evidence. Every outcome requires human follow-up; this desk never releases stock.</p>
+<label for="token">Access token</label><input id="token" type="password" autocomplete="off" spellcheck="false">
+<small>Use the token from your local .env file. It stays in this tab and is sent in request headers.</small>
+<label for="shipment">Shipment</label><select id="shipment">
+<option>HL-2201</option><option>HL-2202</option><option>HL-2203</option><option>HL-2204</option>
+</select>
+<p>Rehearsal reads real service evidence without calling a model.</p>
+<button id="go">Run rehearsal or retry</button><button id="new">Start a new review</button>
+<p id="status" class="status" role="status" aria-live="polite">Ready for a review.</p>
+<p id="explanation"></p>
+<details><summary>Evidence and audit record</summary><pre id="out">No review yet.</pre></details>
+<script>
+let key=crypto.randomUUID();
+const el=id=>document.getElementById(id);
+const reset=()=>{key=crypto.randomUUID();el('status').textContent='Ready for a new review.';el('explanation').textContent='';el('out').textContent='No review yet.';};
+el('new').onclick=reset;el('shipment').onchange=reset;
+el('go').onclick=async()=>{
+ if(!el('token').value){el('status').textContent='Enter your access token first.';return;}
+ el('go').disabled=true;el('new').disabled=true;el('shipment').disabled=true;
+ el('status').textContent='Collecting evidence…';
+ try{
+  const response=await fetch('/cases',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+el('token').value,'Idempotency-Key':key},body:JSON.stringify({shipment_id:el('shipment').value,mode:'rehearsal'})});
+  const result=await response.json();
+  if(!response.ok)throw new Error(result.detail||'Review unavailable. Retry this review.');
+  el('status').textContent=result.review.disposition+(result.replayed?' — saved result':' — recorded');
+  el('explanation').textContent=result.review.explanation;
+  el('out').textContent=JSON.stringify(result,null,2);
+ }catch(error){el('status').textContent=error.message;}
+ finally{el('go').disabled=false;el('new').disabled=false;el('shipment').disabled=false;}
+};
+</script>
+</body></html>

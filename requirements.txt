@@ -1,0 +1,2 @@
+# Reproducible runtime installation. Edit requirements.in when updating dependencies.
+-r requirements.lock.txt
